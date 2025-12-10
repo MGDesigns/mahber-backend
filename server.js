@@ -1,3 +1,4 @@
+import "dotenv/config";      // ✅ ENV correct inladen
 import express from "express";
 import cors from "cors";
 import nodemailer from "nodemailer";
@@ -6,19 +7,20 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-let counter = 1000;
+let counter = 1000; // ⚠️ tijdelijk – dit hoort later in database
 
-// Mail setup
+// ✅ BREVO SMTP CONFIG (GECORRIGEERD)
 const transporter = nodemailer.createTransport({
-  host: "smtp.hostinger.com",
-  port: 587,
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT), // ✅ nu correct nummer
   secure: false,
   auth: {
-    user: "info@mahber.be",
-    pass: "AhYalanDunya25.15!"
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS
   }
 });
 
+// ✅ Leeftijd correct berekenen
 function calculateAge(birth) {
   const today = new Date();
   const birthDate = new Date(birth);
@@ -34,14 +36,19 @@ app.post("/register", async (req, res) => {
   try {
     const data = req.body;
 
+    // ✅ Leeftijdscontrole 65+
     const age = calculateAge(data.birth_date);
     if (age >= 65) {
-      return res.status(400).json({ message: "Leeftijdsgrens overschreden" });
+      return res.status(400).json({
+        message: "Inschrijving niet toegestaan: leeftijdsgrens 65 jaar bereikt."
+      });
     }
 
+    // ✅ Lidnummer correct formaat
     const year = new Date().getFullYear();
     const memberId = `M${counter++}-${year}`;
 
+    // ✅ Mail versturen via Brevo
     await transporter.sendMail({
       from: "Mahber <info@mahber.be>",
       to: data.email,
@@ -66,10 +73,13 @@ Team Mahber
     });
 
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Serverfout" });
+    console.error("MAIL ERROR:", err);
+    res.status(500).json({ message: "Serverfout bij verzending e-mail" });
   }
 });
 
+// ✅ Render juiste poort
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("Mahber API draait op poort " + PORT));
+app.listen(PORT, () => {
+  console.log("Mahber API draait op poort " + PORT);
+});
