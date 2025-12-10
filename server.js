@@ -12,13 +12,17 @@ let counter = 1000; // ⚠️ tijdelijk – dit hoort later in database
 // ✅ BREVO SMTP CONFIG (GECORRIGEERD)
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT), // ✅ nu correct nummer
-  secure: false,
+  port: Number(process.env.SMTP_PORT),
+  secure: false, // MOET false zijn bij 587
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS
+  },
+  tls: {
+    rejectUnauthorized: false
   }
 });
+
 
 // ✅ Leeftijd correct berekenen
 function calculateAge(birth) {
