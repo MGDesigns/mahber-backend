@@ -1,28 +1,13 @@
-import "dotenv/config";      // ✅ ENV correct inladen
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import nodemailer from "nodemailer";
+import axios from "axios";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-let counter = 1000; // ⚠️ tijdelijk – dit hoort later in database
-
-// ✅ BREVO SMTP CONFIG (GECORRIGEERD)
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT),
-  secure: false, // MOET false zijn bij 587
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
-  },
-  tls: {
-    rejectUnauthorized: false
-  }
-});
-
+let counter = 1000; // ⚠️ Later vervangen door database
 
 // ✅ Leeftijd correct berekenen
 function calculateAge(birth) {
@@ -52,13 +37,15 @@ app.post("/register", async (req, res) => {
     const year = new Date().getFullYear();
     const memberId = `M${counter++}-${year}`;
 
-    // ✅ Mail versturen via Brevo
-    await transporter.sendMail({
-      from: "Mahber <info@mahber.be>",
-      to: data.email,
-      cc: "info@mahber.be",
-      subject: "Welkom bij Mahber – Uw lidnummer",
-      text: `
+    // ✅ Mail versturen via BREVO API (geen SMTP meer!)
+    await axios.post(
+      "https://api.brevo.com/v3/smtp/email",
+      {
+        sender: { name: "Mahber", email: "info@mahber.be" },
+        to: [{ email: data.email }],
+        cc: [{ email: "info@mahber.be" }],
+        subject: "Welkom bij Mahber – Uw lidnummer",
+        textContent: `
 Beste ${data.first_name},
 
 Dank voor uw registratie bij Mahber.
@@ -69,7 +56,14 @@ ${memberId}
 Met respect,
 Team Mahber
 `
-    });
+      },
+      {
+        headers: {
+          "api-key": process.env.BREVO_API_KEY,
+          "Content-Type": "application/json"
+        }
+      }
+    );
 
     res.json({
       message: "Registratie succesvol! Controleer uw e-mail.",
@@ -77,12 +71,12 @@ Team Mahber
     });
 
   } catch (err) {
-    console.error("MAIL ERROR:", err);
+    console.error("MAIL ERROR:", err.response?.data || err);
     res.status(500).json({ message: "Serverfout bij verzending e-mail" });
   }
 });
 
-// ✅ Render juiste poort
+// ✅ Render correcte poort
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log("Mahber API draait op poort " + PORT);
