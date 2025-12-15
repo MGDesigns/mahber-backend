@@ -12,17 +12,17 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ----------------------------------------
+// --------------------------------------------------
 // DATABASE
-// ----------------------------------------
+// --------------------------------------------------
 const pool = new Pool({
   connectionString: process.env.DB_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// ----------------------------------------
-// HULPFUNCTIES
-// ----------------------------------------
+// --------------------------------------------------
+// HELPERS
+// --------------------------------------------------
 function calculateAge(birth) {
   const today = new Date();
   const d = new Date(birth);
@@ -41,19 +41,25 @@ function createInvoicePDF(member, memberId) {
     doc.pipe(stream);
     doc.fontSize(22).text("Mahber — Lidmaatschapsfactuur", { underline: true });
     doc.moveDown();
+
     doc.fontSize(14).text(`Lidnummer: ${memberId}`);
     doc.text(`Naam: ${member.first_name} ${member.last_name}`);
+    doc.text(`E-mail: ${member.email}`);
+    doc.text(`Adres: ${member.street}, ${member.postal_code} ${member.city}`);
+    doc.moveDown();
+
     doc.text("Bedrag: €50");
     doc.text("Omschrijving: Jaarlijks lidmaatschap Mahber");
-    doc.end();
+    doc.text("Betaaltermijn: 14 dagen");
 
+    doc.end();
     stream.on("finish", () => resolve(filePath));
   });
 }
 
-// ----------------------------------------
+// --------------------------------------------------
 // REGISTRATIE
-// ----------------------------------------
+// --------------------------------------------------
 app.post("/register", async (req, res) => {
   const data = req.body;
   const client = await pool.connect();
@@ -61,21 +67,19 @@ app.post("/register", async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // Leeftijd
+    // Leeftijdscontrole
     if (calculateAge(data.birth_date) >= 65) {
       throw new Error("Leeftijdsgrens overschreden");
     }
 
-    // Lidnummer
-    const seqResult = await client.query(
-      "SELECT nextval('member_seq') AS seq"
-    );
+    // Uniek lidnummer
+    const seqResult = await client.query("SELECT nextval('member_seq') AS seq");
     const seq = seqResult.rows[0].seq;
     const memberCode = `M${seq}-${new Date().getFullYear()}`;
 
-    // -------------------------
-    // MEMBER (1 PER GEZIN)
-    // -------------------------
+    // --------------------------------------------------
+    // MEMBER
+    // --------------------------------------------------
     const memberResult = await client.query(
       `INSERT INTO members
        (member_id, seq_id, first_name, last_name, gender, birth_date,
@@ -105,9 +109,10 @@ app.post("/register", async (req, res) => {
 
     const memberDbId = memberResult.rows[0].id;
 
-    // -------------------------
-    // SPOUSE (optioneel)
-    // -------------------------
+    // --------------------------------------------------
+    // SPOUSE
+    // --------------------------------------------------
+    let spouseText = "Geen partner geregistreerd.";
     if (data.is_married) {
       await client.query(
         `INSERT INTO spouses
@@ -124,12 +129,18 @@ app.post("/register", async (req, res) => {
           data.partner_phone
         ]
       );
+      spouseText = `${data.partner_first_name} ${data.partner_last_name}`;
     }
 
-    // -------------------------
-    // CHILDREN (0..n)
-    // -------------------------
-    if (Array.isArray(data.children)) {
+    // --------------------------------------------------
+    // CHILDREN
+    // --------------------------------------------------
+    let childrenText = "Geen kinderen geregistreerd.";
+    if (Array.isArray(data.children) && data.children.length > 0) {
+      childrenText = data.children
+        .map(c => `- ${c.first_name} ${c.last_name} (${c.birth_date})`)
+        .join("\n");
+
       for (const child of data.children) {
         await client.query(
           `INSERT INTO children
@@ -147,9 +158,9 @@ app.post("/register", async (req, res) => {
       }
     }
 
-    // -------------------------
-    // EMERGENCY (verplicht)
-    // -------------------------
+    // --------------------------------------------------
+    // EMERGENCY
+    // --------------------------------------------------
     await client.query(
       `INSERT INTO emergencies
        (member_id, first_name, last_name, phone)
@@ -162,19 +173,53 @@ app.post("/register", async (req, res) => {
       ]
     );
 
-    // -------------------------
+    // --------------------------------------------------
     // FACTUUR + MAIL
-    // -------------------------
+    // --------------------------------------------------
     const pdfPath = await createInvoicePDF(data, memberCode);
     const pdfBase64 = fs.readFileSync(pdfPath).toString("base64");
+
+    const mailText = `
+Beste ${data.first_name},
+
+Hartelijk dank voor uw inschrijving bij Mahber.
+Wij waarderen het vertrouwen dat u in onze vereniging stelt.
+
+Uw lidnummer:
+${memberCode}
+
+Overzicht van uw registratie:
+
+Hoofdinschrijver:
+${data.first_name} ${data.last_name}
+
+Partner:
+${spouseText}
+
+Kinderen:
+${childrenText}
+
+Noodcontact:
+${data.emergency_first_name} ${data.emergency_last_name}
+Tel: ${data.emergency_phone}
+
+In bijlage vindt u de factuur voor het jaarlijks lidmaatschap (€50).
+
+Heeft u vragen of wenst u wijzigingen?
+Aarzel niet om ons te contacteren via info@mahber.be.
+
+Met vriendelijke groet,
+Team Mahber
+`;
 
     await axios.post(
       "https://api.brevo.com/v3/smtp/email",
       {
         sender: { name: "Mahber", email: "info@mahber.be" },
         to: [{ email: data.email }],
-        subject: "Welkom bij Mahber – Lidnummer & factuur",
-        textContent: `Uw lidnummer is ${memberCode}`,
+        cc: [{ email: "info@mahber.be" }],
+        subject: "Welkom bij Mahber – Bevestiging & factuur",
+        textContent: mailText,
         attachments: [{ name: "factuur.pdf", content: pdfBase64 }]
       },
       { headers: { "api-key": process.env.BREVO_API_KEY } }
@@ -183,20 +228,20 @@ app.post("/register", async (req, res) => {
     await client.query("COMMIT");
 
     res.json({
-      message: "Registratie succesvol (gezin gekoppeld aan 1 lidnummer)",
+      message: "Registratie succesvol. Bevestiging en factuur zijn verzonden.",
       memberId: memberCode
     });
 
   } catch (err) {
     await client.query("ROLLBACK");
     console.error(err);
-    res.status(500).json({ message: "Registratie mislukt" });
+    res.status(500).json({ message: "Registratie mislukt." });
   } finally {
     client.release();
   }
 });
 
-// ----------------------------------------
+// --------------------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () =>
   console.log("Mahber API draait op poort " + PORT)
