@@ -13,15 +13,15 @@ app.use(cors());
 app.use(express.json());
 
 // ----------------------------------------
-// DATABASE CONNECTIE
+// DATABASE
 // ----------------------------------------
 const pool = new Pool({
   connectionString: process.env.DB_URL,
-  ssl: { rejectUnauthorized: false } // Render/Postgres vereist SSL
+  ssl: { rejectUnauthorized: false }
 });
 
 // ----------------------------------------
-// LEEFTIJD CHECK
+// HULPFUNCTIES
 // ----------------------------------------
 function calculateAge(birth) {
   const today = new Date();
@@ -32,9 +32,6 @@ function calculateAge(birth) {
   return age;
 }
 
-// ----------------------------------------
-// PDF FACTUUR GENERATOR
-// ----------------------------------------
 function createInvoicePDF(member, memberId) {
   return new Promise((resolve) => {
     const filePath = `/tmp/factuur_${memberId}.pdf`;
@@ -42,28 +39,12 @@ function createInvoicePDF(member, memberId) {
     const stream = fs.createWriteStream(filePath);
 
     doc.pipe(stream);
-
     doc.fontSize(22).text("Mahber — Lidmaatschapsfactuur", { underline: true });
     doc.moveDown();
-
     doc.fontSize(14).text(`Lidnummer: ${memberId}`);
     doc.text(`Naam: ${member.first_name} ${member.last_name}`);
-    if (member.email) doc.text(`E-mail: ${member.email}`);
-    if (member.phone) doc.text(`Telefoon: ${member.phone}`);
-    if (member.street || member.postal_code || member.city) {
-      doc.moveDown();
-      doc.text("Adres:");
-      if (member.street) doc.text(member.street);
-      let line = "";
-      if (member.postal_code) line += member.postal_code + " ";
-      if (member.city) line += member.city;
-      if (line) doc.text(line);
-    }
-
-    doc.moveDown();
     doc.text("Bedrag: €50");
     doc.text("Omschrijving: Jaarlijks lidmaatschap Mahber");
-
     doc.end();
 
     stream.on("finish", () => resolve(filePath));
@@ -71,127 +52,152 @@ function createInvoicePDF(member, memberId) {
 }
 
 // ----------------------------------------
-// REGISTRATIE ENDPOINT
+// REGISTRATIE
 // ----------------------------------------
 app.post("/register", async (req, res) => {
   const data = req.body;
+  const client = await pool.connect();
 
   try {
-    // 1) Leeftijdscontrole
-    if (!data.birth_date) {
-      return res.status(400).json({ message: "Geboortedatum ontbreekt." });
-    }
+    await client.query("BEGIN");
 
+    // Leeftijd
     if (calculateAge(data.birth_date) >= 65) {
-      return res.status(400).json({
-        message: "Inschrijving niet toegestaan: leeftijdsgrens 65 jaar bereikt."
-      });
+      throw new Error("Leeftijdsgrens overschreden");
     }
 
-    // 2) Nieuwe sequence-waarde uit database halen (altijd uniek)
-    const seqResult = await pool.query(
+    // Lidnummer
+    const seqResult = await client.query(
       "SELECT nextval('member_seq') AS seq"
     );
     const seq = seqResult.rows[0].seq;
-    const year = new Date().getFullYear();
-    const finalMemberId = `M${seq}-${year}`;
+    const memberCode = `M${seq}-${new Date().getFullYear()}`;
 
-    // 3) Member opslaan in database
-    // Let op: we mappen 'street' naar kolom 'address' in je tabel
-    const isMarried = !!data.is_married;
-    const hasChildren = !!data.has_children;
-
-    await pool.query(
-      `INSERT INTO members 
-       (member_id, seq_id, first_name, last_name, gender, birth_date, birth_place, 
-        email, phone, address, postal_code, city, address_extra, is_married, has_children, created_at)
-       VALUES 
-       ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW())`,
+    // -------------------------
+    // MEMBER (1 PER GEZIN)
+    // -------------------------
+    const memberResult = await client.query(
+      `INSERT INTO members
+       (member_id, seq_id, first_name, last_name, gender, birth_date,
+        birth_place, email, phone, address, postal_code, city,
+        address_extra, is_married, has_children, created_at)
+       VALUES
+       ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW())
+       RETURNING id`,
       [
-        finalMemberId,
+        memberCode,
         seq,
         data.first_name,
         data.last_name,
-        data.gender || null,
+        data.gender,
         data.birth_date,
-        data.birth_place || null,
+        data.birth_place,
         data.email,
-        data.phone || null,
-        data.street || null,       // => address
-        data.postal_code || null,
-        data.city || null,
-        data.address_extra || null,
-        isMarried,
-        hasChildren
+        data.phone,
+        data.street,
+        data.postal_code,
+        data.city,
+        data.address_extra,
+        !!data.is_married,
+        !!data.has_children
       ]
     );
 
-    // (Optioneel: later spouses/children/emergency toevoegen zodra frontend JSON-structuur duidelijk is)
+    const memberDbId = memberResult.rows[0].id;
 
-    // 4) Factuur PDF genereren
-    const pdfPath = await createInvoicePDF(data, finalMemberId);
-    const pdfBuffer = fs.readFileSync(pdfPath);
-    const base64Pdf = pdfBuffer.toString("base64");
+    // -------------------------
+    // SPOUSE (optioneel)
+    // -------------------------
+    if (data.is_married) {
+      await client.query(
+        `INSERT INTO spouses
+         (member_id, first_name, last_name, gender, birth_date, birth_place, email, phone)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [
+          memberDbId,
+          data.partner_first_name,
+          data.partner_last_name,
+          data.partner_gender,
+          data.partner_birth_date,
+          data.partner_birth_place,
+          data.partner_email,
+          data.partner_phone
+        ]
+      );
+    }
 
-    // 5) Email versturen via Brevo API (met bijlage)
+    // -------------------------
+    // CHILDREN (0..n)
+    // -------------------------
+    if (Array.isArray(data.children)) {
+      for (const child of data.children) {
+        await client.query(
+          `INSERT INTO children
+           (member_id, first_name, last_name, gender, birth_date, birth_place)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [
+            memberDbId,
+            child.first_name,
+            child.last_name,
+            child.gender,
+            child.birth_date,
+            child.birth_place
+          ]
+        );
+      }
+    }
+
+    // -------------------------
+    // EMERGENCY (verplicht)
+    // -------------------------
+    await client.query(
+      `INSERT INTO emergencies
+       (member_id, first_name, last_name, phone)
+       VALUES ($1,$2,$3,$4)`,
+      [
+        memberDbId,
+        data.emergency_first_name,
+        data.emergency_last_name,
+        data.emergency_phone
+      ]
+    );
+
+    // -------------------------
+    // FACTUUR + MAIL
+    // -------------------------
+    const pdfPath = await createInvoicePDF(data, memberCode);
+    const pdfBase64 = fs.readFileSync(pdfPath).toString("base64");
+
     await axios.post(
       "https://api.brevo.com/v3/smtp/email",
       {
         sender: { name: "Mahber", email: "info@mahber.be" },
         to: [{ email: data.email }],
-        cc: [{ email: "info@mahber.be" }],
-        subject: "Welkom bij Mahber – Uw lidnummer & factuur",
-        textContent: `
-Beste ${data.first_name},
-
-Bedankt voor uw registratie bij Mahber.
-
-Uw lidnummer is:
-${finalMemberId}
-
-In de bijlage vindt u uw factuur voor het lidmaatschap.
-
-Met respect,
-Team Mahber
-`,
-        attachments: [
-          {
-            name: `factuur_${finalMemberId}.pdf`,
-            content: base64Pdf
-          }
-        ]
+        subject: "Welkom bij Mahber – Lidnummer & factuur",
+        textContent: `Uw lidnummer is ${memberCode}`,
+        attachments: [{ name: "factuur.pdf", content: pdfBase64 }]
       },
-      {
-        headers: {
-          "api-key": process.env.BREVO_API_KEY,
-          "Content-Type": "application/json"
-        }
-      }
+      { headers: { "api-key": process.env.BREVO_API_KEY } }
     );
 
-    // Optioneel: tijdelijke file opruimen
-    try {
-      fs.unlinkSync(pdfPath);
-    } catch (e) {
-      console.warn("Kon tijdelijke PDF niet verwijderen:", e.message);
-    }
+    await client.query("COMMIT");
 
-    // 6) Response naar frontend
     res.json({
-      message: "Registratie succesvol! E-mail + factuur verzonden.",
-      memberId: finalMemberId
+      message: "Registratie succesvol (gezin gekoppeld aan 1 lidnummer)",
+      memberId: memberCode
     });
 
   } catch (err) {
-    console.error("REGISTRATIE FOUT:", err.response?.data || err);
-    res.status(500).json({ message: "Serverfout bij registratie of e-mail." });
+    await client.query("ROLLBACK");
+    console.error(err);
+    res.status(500).json({ message: "Registratie mislukt" });
+  } finally {
+    client.release();
   }
 });
 
 // ----------------------------------------
-// SERVER STARTEN
-// ----------------------------------------
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log("Mahber API draait op poort " + PORT);
-});
+app.listen(PORT, () =>
+  console.log("Mahber API draait op poort " + PORT)
+);
